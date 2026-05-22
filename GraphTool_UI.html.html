@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <link rel="stylesheet" href="https://ssl.gstatic.com/docs/script/css/add-ons1.css">
+    <style>
+      .container { padding: 15px; } .form-group { margin-bottom: 10px; }
+      label { font-weight: bold; display: block; margin-bottom: 5px; }
+      select, button { width: 100%; }
+      .destructive { background-color: #dc3545; border-color: #dc3545; color: white; margin-top: 5px;}
+      .note { font-size: 12px; color: #666; margin-top: 5px;}
+      fieldset { border: 1px solid #ccc; border-radius: 4px; padding: 10px; margin-bottom: 15px; }
+      legend { font-weight: bold; }
+      .checkbox-group label { font-weight: normal; display: block; }
+      #progressLog {
+        margin-top: 15px; padding: 10px; background-color: #f3f3f3;
+        border: 1px solid #ccc; border-radius: 4px; height: 200px;
+        overflow-y: auto; white-space: pre-wrap; font-family: monospace;
+        font-size: 12px; display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h4>グラフ生成ツール</h4>
+      <div id="form-container">
+        <div class="form-group">
+          <label for="clinicSelect">拠点を選択</label>
+          <select id="clinicSelect">
+            <option>西葛西</option><option>北葛西</option><option>代官山</option><option>東雲</option><option>亀有</option><option>錦糸町</option><option>光が丘</option><option>板橋</option><option>西新井</option><option>国立</option><option>北綾瀬</option><option>東品川</option><option>武蔵小山</option><option>武蔵小杉</option><option>天王町</option><option>海老名</option><option>茅ヶ崎</option><option>小田栄</option><option>東戸塚</option><option>相模原</option><option>高田</option><option>新百合ヶ丘</option><option>柏の葉</option><option>流山おおたかの森</option><option>八千代緑が丘</option><option>千葉ニュータウン中央</option><option>新鎌ケ谷</option><option>稲毛海岸</option><option>村上</option><option>志木</option><option>越谷レイクタウン</option><option>川口</option><option>まるひろ南浦和店</option><option>草加松原</option><option>川越</option><option>所沢</option><option>与野</option><option>東岸和田</option><option>阿波座</option><option>天美</option><option>堺鉄砲町</option><option>長吉長原</option><option>鶴見緑地</option><option>今里</option><option>千里</option><option>豊中</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="yearSelect">年度を選択</label>
+          <select id="yearSelect"></select>
+          <p class="note" id="forecastNote"></p>
+        </div>
+        <fieldset>
+          <legend>生成するグラフを選択</legend>
+          <div class="checkbox-group">
+            <label><input type="checkbox" name="chartType" value="salesAndRate" checked> ① 売上と人件費率</label>
+            <label><input type="checkbox" name="chartType" value="salesShare" checked> ② 売上シェア（医師給与）</label>
+            <label><input type="checkbox" name="chartType" value="doctorCount" checked> ③ 勤務医師数</label>
+            <label><input type="checkbox" name="chartType" value="costBreakdown" checked> ④ 人件費の内訳</label>
+            <label><input type="checkbox" name="chartType" value="budgetBalance" checked> ⑤ 予算残額</label> </div>
+        </fieldset>
+      </div>
+      
+      <button class="action" id="runButton" onclick="start()" disabled>グラフを生成</button>
+      <button class="destructive" id="cancelButton" onclick="cancel()" style="display:none;">処理を中止</button>
+      
+      <div id="progressLog"></div>
+    </div>
+
+    <script>
+      let isCancelled = false;
+      let hasFinished = false; // ★ 新規追加：二重実行防止フラグ
+      let totalMonths = 0;
+      let currentMonthIndex = 0;
+      
+      const formContainer = document.getElementById('form-container');
+      const yearSelect = document.getElementById('yearSelect');
+      const forecastNote = document.getElementById('forecastNote');
+      const runButton = document.getElementById('runButton');
+      const cancelButton = document.getElementById('cancelButton');
+      const logContainer = document.getElementById('progressLog');
+
+      yearSelect.addEventListener('change', updateForecastNote);
+      document.addEventListener('DOMContentLoaded', () => {
+        google.script.run.withSuccessHandler(populateYearList).gt_getAvailableYears();
+      });
+
+      function populateYearList(years) {
+        years.forEach(year => yearSelect.add(new Option(`${year}年度`, year)));
+        updateForecastNote();
+        runButton.disabled = false;
+      }
+
+      function updateForecastNote() {
+        const today = new Date();
+        const currentFiscalYear = today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
+        const selectedYear = parseInt(yearSelect.value, 10);
+        
+        // ★ 3分岐ロジックに合わせてテキストも修正
+        const currentMonth = today.getMonth() + 1;
+        if (selectedYear === currentFiscalYear) {
+          forecastNote.textContent = `※当年度：${currentMonth - 1}月までは実績、${currentMonth}月以降は予測で計算されます。`;
+        } else if (selectedYear < currentFiscalYear) {
+          forecastNote.textContent = `※過去年度のため、全て実績値で計算されます。`;
+        } else {
+          forecastNote.textContent = `※未来年度のため、全て予測値で計算されます。`;
+        }
+      }
+
+      function start() {
+        isCancelled = false;
+        hasFinished = false; // ★ 新規追加：実行開始時にフラグをリセット
+        const selectedCharts = Array.from(document.querySelectorAll('input[name="chartType"]:checked')).map(cb => cb.value);
+        if (selectedCharts.length === 0) {
+          logContainer.textContent = 'グラフの種類を1つ以上選択してください。';
+          logContainer.style.display = 'block';
+          return;
+        }
+        
+        const params = {
+          clinic: document.getElementById('clinicSelect').value,
+          year: yearSelect.value
+        };
+        
+        setUiState('running');
+        logContainer.textContent = `【${params.clinic} ${params.year}年度】の集計準備を開始します...`;
+
+        google.script.run
+          .withSuccessHandler(onStartSuccess)
+          .withFailureHandler(onFailure)
+          .gt_startCalculation(params);
+      }
+
+      function onStartSuccess(result) {
+        if (isCancelled) return;
+        totalMonths = result.totalMonths;
+        currentMonthIndex = 0;
+        logContainer.textContent += `\n準備完了。全 ${totalMonths} ヶ月の処理を開始します。`;
+        processMonth();
+      }
+      
+      function processMonth() {
+        if (isCancelled || hasFinished) return; // ★ 修正：完了後に実行されないようガード
+        
+        if (currentMonthIndex >= totalMonths) {
+          finish(); // 最後の月の処理が終わったら完了処理を呼ぶ
+          return;
+        }
+        
+        runButton.textContent = `計算中... (${currentMonthIndex + 1}/${totalMonths}ヶ月目)`;
+        
+        google.script.run
+          .withSuccessHandler(onProcessMonthSuccess)
+          .withFailureHandler(onFailure)
+          .gt_processOneMonth(currentMonthIndex);
+      }
+
+      function onProcessMonthSuccess(logMessage) {
+        if (isCancelled || hasFinished) return; // ★ 修正：完了後にログ追加されないようガード
+        
+        logContainer.textContent += `\n${logMessage}`;
+        logContainer.scrollTop = logContainer.scrollHeight;
+        
+        currentMonthIndex++;
+        processMonth(); // 次の月を処理
+      }
+
+      function finish() {
+        // --- ★★★ クラッシュ対策：二重実行防止 ★★★ ---
+        if (isCancelled || hasFinished) {
+            Logger.log("Finish called, but already cancelled or finished.");
+            return; 
+        }
+        hasFinished = true; // ★フラグを立てて二重実行をブロック
+        // --- ★★★ 対策完了 ★★★ ---
+
+        logContainer.textContent += "\n\n全期間の計算完了。シートへ書き込んでいます...";
+        runButton.textContent = '書き込み中...';
+        
+        const params = {
+          clinic: document.getElementById('clinicSelect').value,
+          charts: Array.from(document.querySelectorAll('input[name="chartType"]:checked')).map(cb => cb.value)
+        };
+        
+        google.script.run
+          .withSuccessHandler(onFinishSuccess)
+          .withFailureHandler(onFailure)
+          .gt_finishCalculation(params);
+      }
+      
+      function onFinishSuccess(message) {
+        logContainer.textContent += `\n${message}`;
+        setUiState('idle');
+      }
+      
+      function onFailure(error) {
+        logContainer.textContent += `\n\nエラー: ${error.message}`;
+        setUiState('idle');
+        hasFinished = true; // エラー時もフラグを立てて停止
+      }
+
+      function cancel() {
+        isCancelled = true;
+        hasFinished = true; // ★ 中止時もフラグを立てる
+        logContainer.textContent += `\n\n手動で処理を中止しました。`;
+        google.script.run.gt_cancelCalculation();
+        setUiState('idle');
+      }
+
+      function setUiState(state) {
+        if (state === 'running') {
+          formContainer.querySelectorAll('select, input').forEach(el => el.disabled = true);
+          runButton.style.display = 'none';
+          cancelButton.style.display = 'block';
+          logContainer.style.display = 'block';
+        } else { // idle
+          formContainer.querySelectorAll('select, input').forEach(el => el.disabled = false);
+          runButton.textContent = 'グラフを生成';
+          runButton.disabled = false;
+          runButton.style.display = 'block';
+          cancelButton.style.display = 'none';
+        }
+      }
+    </script>
+  </body>
+</html>

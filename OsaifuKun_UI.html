@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DotGothic16&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-color: #c7d2b8; --text-color: #0f380f; --border-color: #0f380f;
+      --highlight-color: #8bac0f; --cancel-bg-color: #721c24; --cancel-text-color: #c7d2b8;
+    }
+    body {
+      font-family: 'DotGothic16', sans-serif; background-color: var(--bg-color);
+      color: var(--text-color); padding: 10px; font-size: 16px;
+    }
+    .container {
+      border: 3px solid var(--border-color); padding: 15px; background-color: var(--highlight-color);
+    }
+    .form-group, .result-group { margin-bottom: 15px; }
+    label, h3 { display: block; margin-bottom: 5px; }
+    select, input[type="date"], button {
+      width: 100%; padding: 8px; background-color: var(--bg-color);
+      border: 2px solid var(--border-color); color: var(--text-color);
+      font-family: inherit; font-size: 16px; box-sizing: border-box; margin-top: 5px;
+    }
+    button { font-weight: bold; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
+    #cancelButton { background-color: var(--cancel-bg-color); color: var(--cancel-text-color); }
+    hr { border: none; border-top: 3px solid var(--border-color); margin: 20px 0; }
+    #progressLog {
+      height: 150px; white-space: pre-wrap; overflow-y: auto; background-color: var(--bg-color);
+      border: 2px solid var(--border-color); padding: 10px; margin-top: 10px;
+    }
+    .result-main { text-align: center; }
+    .result-main-value { font-size: 32px; font-weight: bold; }
+    .result-main-disclaimer { font-size: 12px; margin-top: 5px; }
+    .schedule-box {
+      border: 3px solid var(--border-color); background-color: var(--bg-color); padding: 15px;
+    }
+    .schedule-box h4 { text-align: center; margin-top: 0; }
+    .schedule-list { list-style: none; padding-left: 0; font-size: 14px; }
+    .schedule-list li { margin-bottom: 5px; }
+    .schedule-segment-title { font-weight: bold; margin-top: 10px; }
+    .breakdown-table { width: 100%; font-size: 14px; border-spacing: 0 8px; margin-top: 10px; }
+    .breakdown-table td:last-child { text-align: right; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h3 style="text-align:center; margin:0 0 15px 0;">お財布くん</h3>
+
+    <div id="formContainer">
+      <div class="form-group">
+        <label for="clinicSelect">拠点:</label>
+        <select id="clinicSelect" disabled> <option>読み込み中...</option> </select>
+      </div>
+      <div class="form-group">
+        <label for="dateSelect">日付:</label>
+        <input type="date" id="dateSelect">
+      </div>
+    </div>
+    <button id="runButton" onclick="startMainCalculation()">[ 計算実行 ]</button>
+    <button id="cancelButton" onclick="cancelMainCalculation()" style="display:none;">[ 中止する ]</button>
+    
+    <hr>
+
+    <div id="resultContainer" style="display:none;">
+      
+      <div id="progressArea">
+        <h3>■ 計算プロセスログ</h3>
+        <div id="progressLog"></div>
+      </div>
+
+      <div id="summaryArea">
+        <div class="result-group result-main">
+          <h3>■ 当月残額見込み</h3>
+          <div class="result-main-value" id="remainingAmount"></div>
+          <p class="result-main-disclaimer" id="disclaimerText">
+            ※未充足の２診目コストは除外しています。<br>あくまで現時点での残額予想です。
+          </p>
+        </div>
+
+        <div class="result-group schedule-box">
+          <h4 id="scheduleTitle"></h4>
+          <div id="scheduleDetails"></div>
+        </div>
+        
+        <div class="result-group">
+          <h3>■ 計算内訳</h3>
+          <table class="breakdown-table">
+            <tr><td>+ 月次総予算</td><td id="budgetAmount"></td></tr>
+            <tr><td>- 実績費用 (～昨日)</td><td id="actualsAmount"></td></tr>
+            <tr><td>- 確定予測費用 (本日～月末)</td><td id="projectionsAmount"></td></tr>
+            <tr><td colspan="2" style="font-size: 10px;">============================</td></tr>
+            <tr><td>= 当月残額見込み</td><td id="finalAmountInBreakdown"></td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // --- DOM要素の取得 ---
+  const runButton = document.getElementById('runButton');
+  const cancelButton = document.getElementById('cancelButton');
+  const formContainer = document.getElementById('formContainer');
+  const resultContainer = document.getElementById('resultContainer');
+  const progressArea = document.getElementById('progressArea');
+  const progressLog = document.getElementById('progressLog');
+  const summaryArea = document.getElementById('summaryArea');
+  const clinicSelect = document.getElementById('clinicSelect');
+  const dateSelect = document.getElementById('dateSelect');
+  
+  // --- グローバル変数 ---
+  let isCancelled = false;
+  let totalDaysToProcess = 0;
+  let currentDayIndex = 0;
+  let isCalculationRunning = false;
+  
+  // --- 初期化処理 ---
+  document.addEventListener('DOMContentLoaded', () => {
+    google.script.run.withSuccessHandler(populateClinics).getClinicListForUI();
+    dateSelect.valueAsDate = new Date();
+    dateSelect.addEventListener('change', fetchAndDisplaySchedule);
+    clinicSelect.addEventListener('change', fetchAndDisplaySchedule);
+  });
+
+  function populateClinics(clinics) {
+    clinicSelect.innerHTML = '';
+    if (clinics && clinics.length > 0) {
+      clinics.forEach(c => {
+        const option = new Option(c, c);
+        clinicSelect.appendChild(option);
+      });
+      clinicSelect.disabled = false;
+      fetchAndDisplaySchedule();
+    } else {
+      clinicSelect.innerHTML = '<option>拠点リスト読込失敗</option>';
+    }
+  }
+
+  // --- メイン計算処理フロー ---
+  function startMainCalculation() {
+    if (isCalculationRunning) return; 
+    isCalculationRunning = true;
+    isCancelled = false;
+    setUiState('running');
+    progressLog.textContent = '計算準備を開始します...';
+    google.script.run
+      .withSuccessHandler(onStartSuccess)
+      .withFailureHandler(onFailure)
+      .startOsaifuKunCalculation(clinicSelect.value, dateSelect.value);
+  }
+
+  function onStartSuccess(result) {
+    if (isCancelled) { isCalculationRunning = false; return; }
+    if (!result.success) { onFailure({ message: result.message }); return; }
+    totalDaysToProcess = result.totalDays;
+    currentDayIndex = 0;
+    progressLog.textContent += `\n準備完了。今月全 ${totalDaysToProcess} 日間の処理を開始します。`;
+    processDay();
+  }
+
+  function processDay() {
+    if (isCancelled) return; 
+    if (currentDayIndex >= totalDaysToProcess) {
+      finishMainCalculation();
+      return;
+    }
+    runButton.textContent = `計算中... (${currentDayIndex + 1}/${totalDaysToProcess}日目)`;
+    google.script.run
+      .withSuccessHandler(onProcessDaySuccess)
+      .withFailureHandler(onFailure)
+      .processOsaifuKunDay(currentDayIndex);
+  }
+
+  function onProcessDaySuccess(logMessage) {
+    if (isCancelled) return;
+    progressLog.textContent += `\n${logMessage}`;
+    progressLog.scrollTop = progressLog.scrollHeight;
+    currentDayIndex++;
+    setTimeout(processDay, 1);
+  }
+
+  function finishMainCalculation() {
+    if (isCancelled) return;
+    progressLog.textContent += '\n\n全日程の計算完了。最終結果を集計しています...';
+    google.script.run
+      .withSuccessHandler(onFinishSuccess)
+      .withFailureHandler(onFailure)
+      .finishOsaifuKunCalculation();
+  }
+
+  function onFinishSuccess(result) {
+    if (isCancelled) { isCalculationRunning = false; return; }
+    if (result.success) {
+      const formatter = new Intl.NumberFormat('ja-JP', { style: 'currency', currency: 'JPY', minimumFractionDigits: 0 });
+      document.getElementById('remainingAmount').textContent = formatter.format(result.remainingAmount);
+      document.getElementById('budgetAmount').textContent = formatter.format(result.budget);
+      document.getElementById('actualsAmount').textContent = formatter.format(result.totalActuals);
+      document.getElementById('projectionsAmount').textContent = formatter.format(result.totalProjections);
+      document.getElementById('finalAmountInBreakdown').textContent = formatter.format(result.remainingAmount);
+      fetchAndDisplaySchedule();
+      setUiState('summary');
+    } else {
+      onFailure({ message: result.message });
+    }
+    isCalculationRunning = false;
+  }
+  
+  function cancelMainCalculation() {
+    isCancelled = true;
+    google.script.run.cancelOsaifuKunCalculation();
+    progressLog.textContent += `\n\nユーザー操作により処理を中止しました。`;
+    setUiState('idle');
+    isCalculationRunning = false;
+  }
+
+  function onFailure(error) {
+    if (isCancelled) { isCalculationRunning = false; return; }
+    progressLog.textContent += `\n\nエラーが発生しました: ${error.message}`;
+    setUiState('idle-error');
+    isCalculationRunning = false;
+  }
+
+  // --- 勤務予定の取得と表示 ---
+  function fetchAndDisplaySchedule() {
+    if (isCalculationRunning) return;
+    const scheduleTitle = document.getElementById('scheduleTitle');
+    const scheduleDetails = document.getElementById('scheduleDetails');
+    const date = new Date(dateSelect.value);
+    const dateString = `${date.getMonth() + 1}/${date.getDate()}(${['日','月','火','水','木','金','土'][date.getDay()]})`;
+    scheduleTitle.textContent = `■ ${dateString} 勤務予定`;
+    scheduleDetails.innerHTML = '<p>読み込み中...</p>';
+    if (!isCalculationRunning) {
+        resultContainer.style.display = 'block';
+        summaryArea.style.display = 'block';
+        progressArea.style.display = 'none';
+    }
+    google.script.run
+      .withSuccessHandler(renderSchedule)
+      .withFailureHandler(error => { scheduleDetails.innerHTML = `<p>予定の取得に失敗: ${error.message}</p>`; })
+      .getDailySchedule(clinicSelect.value, dateSelect.value);
+  }
+
+  function renderSchedule(schedule) {
+    const scheduleDetails = document.getElementById('scheduleDetails');
+    scheduleDetails.innerHTML = '';
+    const segments = [
+      { title: '--- 午前 (09:00-13:00) ---', data: schedule.am },
+      { title: '--- 午後 (15:00-18:00) ---', data: schedule.pm },
+      { title: '--- 夜間 (18:00-21:00) ---', data: schedule.night }
+    ];
+    
+    segments.forEach(seg => {
+      const titleEl = document.createElement('p');
+      titleEl.className = 'schedule-segment-title';
+      titleEl.textContent = seg.title;
+      scheduleDetails.appendChild(titleEl);
+      const listEl = document.createElement('ul');
+      listEl.className = 'schedule-list';
+      if (seg.data && seg.data.length > 0) {
+        seg.data.forEach(item => {
+          const itemEl = document.createElement('li');
+          itemEl.textContent = item;
+          listEl.appendChild(itemEl);
+        });
+      } else {
+        const emptyEl = document.createElement('li');
+        emptyEl.textContent = '（勤務予定なし）';
+        emptyEl.style.fontStyle = 'italic';
+        listEl.appendChild(emptyEl);
+      }
+      scheduleDetails.appendChild(listEl);
+    });
+  }
+
+  // --- UI状態管理 ---
+  function setUiState(state) {
+    const isRunning = state === 'running';
+    runButton.style.display = isRunning ? 'none' : 'block';
+    cancelButton.style.display = isRunning ? 'block' : 'none';
+    formContainer.querySelectorAll('select, input').forEach(el => el.disabled = isRunning);
+    
+    if (state === 'running') {
+      resultContainer.style.display = 'block';
+      summaryArea.style.display = 'none';
+      progressArea.style.display = 'block';
+      progressLog.textContent = '';
+    } else if (state === 'summary') {
+      resultContainer.style.display = 'block';
+      summaryArea.style.display = 'block';
+      progressArea.style.display = 'block';
+    } else if (state === 'idle-error') {
+      resultContainer.style.display = 'block';
+      summaryArea.style.display = 'none';
+      progressArea.style.display = 'block';
+    } else { // idle
+      resultContainer.style.display = 'none';
+    }
+  }
+</script>
+</body>
+</html>

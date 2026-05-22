@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <link rel="stylesheet" href="https://ssl.gstatic.com/docs/script/css/add-ons1.css">
+    <style>
+      .container { padding: 15px; }
+      .form-group { margin-bottom: 15px; }
+      label { font-weight: bold; display: block; margin-bottom: 5px; }
+      select { width: 100%; }
+      button { width: 100%; margin-top: 5px; }
+      .destructive { background-color: #dc3545; border-color: #dc3545; color: white; }
+      .destructive:hover { background-color: #c82333; border-color: #bd2130; }
+      #progressLog {
+        margin-top: 15px; padding: 10px; background-color: #f3f3f3;
+        border: 1px solid #ccc; border-radius: 4px; height: 200px;
+        overflow-y: auto; white-space: pre-wrap; font-family: monospace;
+        font-size: 12px; display: none;
+      }
+      hr.tool-separator {
+        margin-top: 20px;
+        margin-bottom: 15px;
+        border: 0;
+        border-top: 1px solid #ccc;
+      }
+      #avgWageStatus {
+        font-size: 12px;
+        margin-top: 8px;
+        text-align: center;
+        display: none;
+        padding: 5px;
+        border-radius: 3px;
+      }
+      #avgWageStatus.success { background-color: #e6f4ea; color: #155724; }
+      #avgWageStatus.error { background-color: #f8d7da; color: #721c24; }
+      #avgWageStatus.running { background-color: #fff3cd; color: #664d03; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h4>集計月を選択</h4>
+      <div class="form-group">
+        <label for="monthSelect">対象月</label>
+        <select id="monthSelect">
+          <option value="" disabled selected>読み込み中...</option>
+        </select>
+      </div>
+      <button class="action" id="runButton" onclick="start()" disabled>実行</button>
+      <button class="destructive" id="cancelButton" onclick="cancel()" style="display:none;">作業を中止</button>
+      
+      <hr class="tool-separator">
+      
+      <label style="font-size: 11px; font-weight: normal; text-align: center; color: #555;">（別ツール）</label>
+      <button id="avgWageButton" onclick="runAvgWage()">平均時給シートを更新</button>
+      <div id="avgWageStatus"></div>
+      <div id="progressLog"></div>
+    </div>
+
+    <script>
+      let isCancelled = false;
+      let totalDays = 0;
+      let currentDay = 0;
+      const logContainer = document.getElementById('progressLog');
+      const runButton = document.getElementById('runButton');
+      const cancelButton = document.getElementById('cancelButton');
+      const select = document.getElementById('monthSelect');
+      
+      const avgWageButton = document.getElementById('avgWageButton');
+      const avgWageStatus = document.getElementById('avgWageStatus');
+
+
+      document.addEventListener('DOMContentLoaded', () => {
+        google.script.run.withSuccessHandler(populateMonthList).getAvailableMonths();
+      });
+
+      function populateMonthList(months) {
+        select.innerHTML = '';
+        if (months && months.length > 0) {
+          // ★ 今月の YYYY/MM を取得
+          const today = new Date();
+          const currentMonthStr = `${today.getFullYear()}/${String(today.getMonth() + 1).padStart(2, '0')}`;
+          let matchFound = false;
+
+          months.forEach(month => {
+            const option = document.createElement('option');
+            option.value = month; 
+            option.textContent = month;
+            
+            // ★ 当月と一致したら初期選択にする
+            if (month === currentMonthStr) {
+              option.selected = true;
+              matchFound = true;
+            }
+            
+            select.appendChild(option);
+          });
+          
+          // ★ 万が一当月がリストに無かったら、一番上の月を自動選択
+          if (!matchFound && select.options.length > 0) {
+            select.selectedIndex = 0;
+          }
+          
+          runButton.disabled = false;
+        } else {
+          select.innerHTML = '<option disabled>対象月が見つかりません</option>';
+        }
+      }
+      
+      // --- 日次集計ツールのロジック ---
+      function start() {
+        const selectedMonth = select.value;
+        if (!selectedMonth) return;
+        isCancelled = false;
+        showRunningUi();
+        logContainer.textContent = `【${selectedMonth}】の集計準備を開始します...`;
+        google.script.run
+          .withSuccessHandler(onStartSuccess)
+          .withFailureHandler(onFailure)
+          .startCalculation(selectedMonth);
+      }
+
+      function cancel() {
+        isCancelled = true;
+        logContainer.textContent += `\n\n手動で処理を中止しました。`;
+        logContainer.scrollTop = logContainer.scrollHeight;
+        google.script.run.cancelCalculation();
+        resetUi();
+      }
+
+      function onStartSuccess(result) {
+        if (isCancelled) return;
+        totalDays = result.totalDays;
+        currentDay = 0;
+        logContainer.textContent += `\n準備完了。全 ${totalDays} 日間の処理を開始します。`;
+        processDay();
+      }
+      
+      function processDay() {
+        if (isCancelled) return;
+        if (currentDay >= totalDays) {
+          finish();
+          return;
+        }
+        runButton.textContent = `処理中... (${currentDay + 1}/${totalDays}日目)`;
+        google.script.run
+          .withSuccessHandler(onProcessDaySuccess)
+          .withFailureHandler(onFailure)
+          .processOneDay(currentDay);
+      }
+
+      function onProcessDaySuccess(logMessage) {
+        if (isCancelled) return;
+        logContainer.textContent += `\n${logMessage}`;
+        logContainer.scrollTop = logContainer.scrollHeight;
+        currentDay++;
+        processDay();
+      }
+
+      function finish() {
+        if (isCancelled) return;
+        logContainer.textContent += "\n\n全日程の計算完了。シートへ書き込んでいます...";
+        runButton.textContent = '書き込み中...';
+        google.script.run
+          .withSuccessHandler(onFinishSuccess)
+          .withFailureHandler(onFailure)
+          .finishCalculation();
+      }
+      
+      function onFinishSuccess(message) {
+        logContainer.textContent += `\n${message}`;
+        logContainer.scrollTop = logContainer.scrollHeight;
+        resetUi();
+      }
+      
+      function onFailure(error) {
+        logContainer.textContent += `\n\nエラーが発生しました: ${error.message}`;
+        resetUi();
+      }
+
+      // --- UI制御 ---
+      function showRunningUi() {
+        select.disabled = true;
+        runButton.style.display = 'none';
+        cancelButton.style.display = 'block';
+        logContainer.style.display = 'block';
+        avgWageButton.disabled = true;
+      }
+
+      function resetUi() {
+        select.disabled = false;
+        runButton.disabled = false;
+        runButton.textContent = '実行';
+        runButton.style.display = 'block';
+        cancelButton.style.display = 'none';
+        avgWageButton.disabled = false;
+      }
+
+      // --- 平均時給計算ツールのロジック ---
+      function runAvgWage() {
+        if (cancelButton.style.display === 'block') {
+          alert('日次集計ツールの実行が完了してからお試しください。');
+          return;
+        }
+
+        runButton.disabled = true;
+        avgWageButton.disabled = true;
+        select.disabled = true;
+        
+        avgWageStatus.textContent = '平均時給を計算・書き込み中です...';
+        avgWageStatus.className = 'running';
+        avgWageStatus.style.display = 'block';
+
+        google.script.run
+          .withSuccessHandler(onAvgWageSuccess)
+          .withFailureHandler(onAvgWageFailure)
+          .calculateAverageWages_v2(); 
+      }
+
+      function onAvgWageSuccess() {
+        avgWageStatus.textContent = '平均時給シートの更新が完了しました。';
+        avgWageStatus.className = 'success';
+        resetUi();
+        
+        setTimeout(() => { 
+          avgWageStatus.style.display = 'none'; 
+          avgWageStatus.className = '';
+        }, 3000);
+      }
+
+      function onAvgWageFailure(error) {
+        avgWageStatus.textContent = `エラー: ${error.message}`;
+        avgWageStatus.className = 'error';
+        resetUi();
+      }
+    </script>
+  </body>
+</html>
