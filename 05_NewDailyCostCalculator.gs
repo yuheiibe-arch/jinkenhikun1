@@ -1,6 +1,6 @@
 /**
  * ====================================================================
- * 【ファイル: 05_NewDailyCostCalculator.gs】(完全一致修正版)
+ * 【ファイル: 05_NewDailyCostCalculator.gs】(キャッシュ互換性修正版)
  * 日次コスト計算の統合・分岐エンジン（ルーター）
  * ====================================================================
  */
@@ -18,34 +18,12 @@ const NewDailyCostCalculator = (function() {
     if (startDate < NEW_SYSTEM_START_DATE && endDate < NEW_SYSTEM_START_DATE) {
       return null; 
     }
-
-    const cache = {
+    return {
       shifts: NewDataFetcher.fetchShiftData(startDate, endDate),
-      ftDoctors: new Set(), 
-      ptDoctors: new Set()  
+      // 🌟 F_DailyTool.gs が Array.from() で変換エラーを起こさないための互換性ダミー
+      ftDoctors: new Set(),
+      ptDoctors: new Set()
     };
-
-    try {
-      const ftData = NewDataFetcher.fetchFullTimeMaster2026();
-      for (let i = 1; i < ftData.length; i++) {
-        const medId = String(ftData[i][1]).trim();
-        if (medId) cache.ftDoctors.add(medId);
-      }
-    } catch (e) {
-      Logger.log(`⚠️ 常勤マスタ(2026)の取得をスキップ: ${e.message}`);
-    }
-
-    try {
-      const ptData = NewDataFetcher.fetchPartTimeMaster2026();
-      for (let i = 1; i < ptData.length; i++) {
-        const medId = String(ptData[i][1]).trim();
-        if (medId) cache.ptDoctors.add(medId);
-      }
-    } catch (e) {
-      Logger.log(`⚠️ 定期非常勤マスタ(2026)の取得をスキップ: ${e.message}`);
-    }
-
-    return cache;
   }
 
   function routeAndCalculateDailyCost(targetDate, allDailyData, settings, cache) {
@@ -65,26 +43,29 @@ const NewDailyCostCalculator = (function() {
 
   function _processNewDailyCost(targetDate, allDailyData, settings, cache) {
     const y = targetDate.getFullYear();
-    const m = targetDate.getMonth() + 1; // ゼロ埋めなし
-    const d = targetDate.getDate();      // ゼロ埋めなし
-    
-    // ★ 旧システムと完全に一致するキー (例: 2026/4/1)
+    const m = targetDate.getMonth() + 1; 
+    const d = targetDate.getDate();
     const dateKey = `${y}/${m}/${d}`;
-
-    // JST文字列で日付を確保
     const fetchDateStr = Utilities.formatDate(targetDate, "JST", "yyyy/MM/dd");
     const holDateStr = Utilities.formatDate(targetDate, "JST", "yyyy-MM-dd");
 
     if (!allDailyData[dateKey]) allDailyData[dateKey] = {};
 
     const isHol = settings.holidays ? settings.holidays.has(holDateStr) : false;
+    
+    // 曜日判定用ヘルパー (特別時給のルールマッチ用)
+    const dayOfWeek = targetDate.getDay();
+    const isWeekday = (dayOfWeek >= 1 && dayOfWeek <= 5 && !isHol);
+    const isSat = (dayOfWeek === 6 && !isHol);
+    const isSun = (dayOfWeek === 0 && !isHol);
+    const isHoliday = isHol;
+
     const dailyShifts = cache.shifts.filter(shift => shift.workDateStr === fetchDateStr);
 
     dailyShifts.forEach(shift => {
       if (!shift.startTimeStr || !shift.endTimeStr || !shift.clinicName) return;
 
       const rawClinic = String(shift.clinicName);
-      
       if (IGNORE_CLINIC_KEYWORDS.some(kw => rawClinic.includes(kw))) {
         return; 
       }
@@ -95,13 +76,11 @@ const NewDailyCostCalculator = (function() {
       }
 
       const medId = String(shift.medId).trim();
+      const normName = gt_normalizePersonName(shift.doctorName, settings.nameAliasMap);
       
       if (!allDailyData[dateKey][clinic]) {
-        // ★ 旧システムと完全に一致するプロパティ名 (totalCost, totalHours)
         allDailyData[dateKey][clinic] = {
-          totalCost: 0, 
-          totalHours: 0, 
-          sales: 0,
+          totalCost: 0, totalHours: 0, sales: 0,
           costDetails: {
             '常勤医師給与': 0, '定期非常勤給与': 0, 'スポット医師給与': 0,
             '直接応募医師給与': 0, '紹介会社医師給与': 0, '所定休出医師給与': 0,
@@ -112,21 +91,22 @@ const NewDailyCostCalculator = (function() {
 
       const dailyClinicObj = allDailyData[dateKey][clinic];
       const comment = shift.comment1 || "";
-      const isAgency = comment.includes("紹介会社");
       const isKyushutsu = comment.includes("所定休出");
 
+      // 🌟 区分の正確な判定
+      const isFT = settings.ftHourlyWageMap.has(normName);
+      // キャッシュから復元された際に、SetではなくArrayに変換されているケースの安全装置
+      const isPT = settings.partTimeDoctorNameSet ? 
+         (typeof settings.partTimeDoctorNameSet.has === 'function' ? settings.partTimeDoctorNameSet.has(normName) : settings.partTimeDoctorNameSet.includes(normName)) 
+         : false;
+      const isAgency = settings.agencyDoctorMedIds ? settings.agencyDoctorMedIds.has(medId) : false;
+
       let category = "";
-      if (isKyushutsu) {
-        category = "所定休出医師給与";
-      } else if (cache.ftDoctors.has(medId)) {
-        category = "常勤医師給与";
-      } else if (cache.ptDoctors.has(medId)) {
-        category = "定期非常勤給与";
-      } else if (isAgency) {
-        category = "紹介会社医師給与";
-      } else {
-        category = "直接応募医師給与";
-      }
+      if (isKyushutsu) category = "所定休出医師給与";
+      else if (isFT) category = "常勤医師給与";
+      else if (isPT) category = "定期非常勤給与";
+      else if (isAgency) category = "紹介会社医師給与";
+      else category = "直接応募医師給与";
 
       let dailyWageSum = 0;
       let dailyHoursSum = 0;
@@ -148,23 +128,71 @@ const NewDailyCostCalculator = (function() {
           
           if (duration > 0) {
             dailyHoursSum += duration;
-            dailyWageSum += slot.wage * duration;
+
+            // 🌟 医師のステータスに応じた時給の適用ロジック
+            if (isFT) {
+              // 【常勤】マスタの固定時給
+              const ftWage = settings.ftHourlyWageMap.get(normName) || 10000;
+              dailyWageSum += ftWage * duration;
+            } 
+            else if (isPT) {
+              // 【定期非常勤】設定された時給タイプに基づく
+              const ptType = settings.ptWageTypeMap ? settings.ptWageTypeMap.get(normName) : "BASE";
+              
+              if (ptType === "FLAT") {
+                const flatWage = settings.ptContractWageMap.get(normName) || 10000;
+                dailyWageSum += flatWage * duration;
+              } else if (ptType === "SPECIAL") {
+                // 特別時給（ルールのマッチング）
+                let appliedWage = slot.wage; // 基本時給にフォールバック
+                const rules = settings.ptSpecialWageRulesMap.get(normName);
+                
+                if (rules) {
+                  for (const r of rules) {
+                    let dayMatch = false;
+                    if (r.dayType === "ALL") dayMatch = true;
+                    else if (r.dayType === "平日" && isWeekday) dayMatch = true;
+                    else if (r.dayType === "土曜" && isSat) dayMatch = true;
+                    else if (r.dayType === "日曜" && isSun) dayMatch = true;
+                    else if (r.dayType === "祝日" && isHoliday) dayMatch = true;
+
+                    if (dayMatch && r.loc === clinic) {
+                      // 時間帯のかぶりをチェック (例: ルールが 19:00-21:00 で スロットが 18:00-21:00 なら適用)
+                      const ruleStart = parseInt(r.start.split(':')[0]) + parseInt(r.start.split(':')[1])/60;
+                      const ruleEnd = parseInt(r.end.split(':')[0]) + parseInt(r.end.split(':')[1])/60;
+                      const slotStart = startH + startM;
+                      const slotEnd = endH + endM;
+                      
+                      if (Math.max(ruleStart, slotStart) < Math.min(ruleEnd, slotEnd)) {
+                        appliedWage = r.wage;
+                        break; 
+                      }
+                    }
+                  }
+                }
+                dailyWageSum += appliedWage * duration;
+              } else {
+                // "BASE" (時給表どおり)
+                dailyWageSum += slot.wage * duration;
+              }
+            } 
+            else {
+              // 【スポット/紹介会社】基本時給
+              dailyWageSum += slot.wage * duration;
+            }
           }
         });
       } catch (e) {
         Logger.log(`⚠️ ${dateKey} [${rawClinic}] ${shift.doctorName} の計算エラー: ${e.message}`);
-        return; 
+        return;
       }
 
-      let extraAllowance = 0; 
-      
-      // ★ 正しいプロパティ名に加算
-      dailyClinicObj.totalCost += dailyWageSum + extraAllowance;
+      dailyClinicObj.totalCost += dailyWageSum;
       dailyClinicObj.totalHours += dailyHoursSum;
       dailyClinicObj.costDetails[category] += dailyWageSum;
-      dailyClinicObj.costDetails['特別手当'] += extraAllowance;
       
-      if (isAgency) {
+      // ★ 紹介会社の場合、算出された金額の20%を「紹介手数料」として追加計上
+      if (isAgency && !isFT && !isPT) {
         const agencyFee = dailyWageSum * AGENCY_FEE_RATE;
         dailyClinicObj.totalCost += agencyFee;
         dailyClinicObj.costDetails['紹介手数料'] += agencyFee;

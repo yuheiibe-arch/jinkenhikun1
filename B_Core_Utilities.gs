@@ -1,10 +1,9 @@
 /**
  * =================================================================
- * 【ファイル 2/6: 共通コア (B_Core_Utilities.gs)】- 修正版
+ * 【ファイル 2/6: 共通コア (B_Core_Utilities.gs)】- 最終完成版 (特別時給解析対応)
  * =================================================================
  */
 
-// ★ 修正箇所1: 引数に targetDateObj を追加し、計算対象の日付を受け取れるようにしました
 function _loadInitialData(spreadsheet, targetDateObj) {
   const urlListSheet = spreadsheet.getSheetByName("URLリスト");
   if (!urlListSheet) throw new Error("「URLリスト」シートが見つかりません。");
@@ -42,68 +41,146 @@ function _loadInitialData(spreadsheet, targetDateObj) {
     });
   });
 
-  let ftHourlyWageMap = new Map();
-  const ftMasterSheet = spreadsheet.getSheetByName('常勤マスタ');
-  if (ftMasterSheet) {
-    ftHourlyWageMap = new Map(ftMasterSheet.getDataRange().getValues().slice(1).map(row => [gt_normalizePersonName(row[2], nameAliasMap), row[25]]));
-  }
-  
-  let ptContractWageMap = new Map();
-  let partTimeDoctorNameSet = new Set();
-  const ptMasterSheet = spreadsheet.getSheetByName('定期非常勤マスタ');
-  if (ptMasterSheet) {
-    const ptMasterData = ptMasterSheet.getDataRange().getValues().slice(1);
-    ptContractWageMap = new Map(ptMasterData.map(row => [gt_normalizePersonName(row[2], nameAliasMap), row[25]])); 
-    partTimeDoctorNameSet = new Set(ptMasterData.map(row => gt_normalizePersonName(row[2], nameAliasMap)).filter(Boolean));
-  }
+  // ====================================================================
+  // 🌟 2026年度 外部医師マスタ（常勤・非常勤）
+  // ====================================================================
+  const MASTER_URL = "https://docs.google.com/spreadsheets/d/1aEjphEv_63SeWQmwiOy9sx7IrMfawU01sHbKd_Ki4iA/edit";
+  const masterSs = SpreadsheetApp.openByUrl(MASTER_URL);
+  const baseDate = targetDateObj || new Date(); 
 
+  const createHeaderMap = (headerRow) => {
+    const map = {};
+    headerRow.forEach((val, idx) => {
+      if (val) map[String(val).replace(/\n/g, '').trim()] = idx;
+    });
+    return map;
+  };
+
+  const ftHourlyWageMap = new Map();
+  
+  const ptWageTypeMap = new Map(); // "BASE", "FLAT", "SPECIAL"
+  const ptContractWageMap = new Map(); // FLATの場合の固定時給
+  const ptSpecialWageRulesMap = new Map(); // SPECIALの場合のルール配列
+
+  const partTimeDoctorNameSet = new Set();
   const doctorContractMap = new Map();
   const ptDoctorContractMapById = new Map();
   const nameToMedicalIdMap = new Map();
 
-  try {
-    const doctorListEntry = getEntry('定期勤務医師リスト_2025年度');
-    const doctorListSheet = SpreadsheetApp.openByUrl(doctorListEntry[1]).getSheetByName(doctorListEntry[2]);
-    const doctorListValues = doctorListSheet.getDataRange().getValues();
-    if (doctorListValues.length > 4) {
-      const header = doctorListValues[4].map(h => String(h).trim());
-      let nameColIdx = header.indexOf("氏名\nスペース\nいれない！！");
-      if (nameColIdx === -1) nameColIdx = header.indexOf("氏名");
-      
-      const medicalIdColIdx = header.indexOf("医籍番号");
-      const typeColIdx = header.indexOf("医師区分");
-      const contractColIdx = header.indexOf("2025年度契約内容");
-      const startDateColIdx = header.indexOf("入職日");
+  // --- [A] 常勤2026年度 ---
+  const ftSheet = masterSs.getSheetByName('常勤2026年度');
+  if (ftSheet) {
+    const ftData = ftSheet.getDataRange().getValues();
+    const ftHMap = createHeaderMap(ftData[0]);
 
-      doctorListValues.slice(5).forEach(row => {
-        const type = row[typeColIdx];
-        const normalizedName = gt_normalizePersonName(row[nameColIdx], nameAliasMap);
-        const medicalId = row[medicalIdColIdx] ? String(row[medicalIdColIdx]).trim() : null;
-        if (normalizedName && medicalId) {
-            nameToMedicalIdMap.set(normalizedName, medicalId);
-        }
-        if (type === "常勤") {
-          if (normalizedName) doctorContractMap.set(normalizedName, { isFullTime: true });
-        } else if (type === "定期非常勤") {
-          if (!medicalId) return;
-          const contractText = row[contractColIdx];
-          const startDateValue = row[startDateColIdx];
-          if (contractText && startDateValue instanceof Date) {
-            const startDate = new Date(startDateValue);
-            startDate.setHours(0,0,0,0);
-            const rules = parseContractToRules(contractText);
-            const contracts = rules.map(rule => ({
-              location: gt_normalizeClinicName(rule.workplace, clinicAliasMap),
-              dayOfWeek: rule.dayOfWeek
-            })).filter(c => c.location && typeof c.dayOfWeek !== 'undefined');
-            ptDoctorContractMapById.set(medicalId, { startDate, contracts, name: normalizedName });
+    for (let i = 1; i < ftData.length; i++) {
+      const row = ftData[i];
+      const rawName = row[ftHMap['医師名']];
+      const rawMedId = row[ftHMap['医籍番号']];
+      const retireDateRaw = row[ftHMap['退職日']];
+      
+      if (!rawName) continue;
+      if (retireDateRaw instanceof Date && !isNaN(retireDateRaw.getTime()) && retireDateRaw < baseDate) continue;
+
+      const normName = gt_normalizePersonName(rawName, nameAliasMap);
+      const medId = rawMedId ? String(rawMedId).trim() : null;
+      const wageVal = parseInt(row[ftHMap['時給']], 10);
+      const wage = isNaN(wageVal) ? 10000 : wageVal;
+
+      if (normName) {
+        ftHourlyWageMap.set(normName, wage);
+        doctorContractMap.set(normName, { isFullTime: true });
+        if (medId) nameToMedicalIdMap.set(normName, medId);
+      }
+    }
+  }
+
+  // --- [B] 定期非常勤2026年度 ---
+  const ptSheet = masterSs.getSheetByName('定期非常勤2026年度');
+  if (ptSheet) {
+    const ptData = ptSheet.getDataRange().getValues();
+    const ptHMap = createHeaderMap(ptData[0]);
+
+    for (let i = 1; i < ptData.length; i++) {
+      const row = ptData[i];
+      const rawName = row[ptHMap['医師名']];
+      const rawMedId = row[ptHMap['医籍番号']];
+      const retireDateRaw = row[ptHMap['退職日']];
+      const contractText = row[ptHMap['勤務備考']];
+      
+      const contractWageType = row[ptHMap['契約時給']] ? String(row[ptHMap['契約時給']]).trim() : "";
+      const specialWageText = row[ptHMap['特別時給の内訳']] ? String(row[ptHMap['特別時給の内訳']]).trim() : "";
+      
+      if (!rawName) continue;
+      if (retireDateRaw instanceof Date && !isNaN(retireDateRaw.getTime()) && retireDateRaw < baseDate) continue;
+
+      const normName = gt_normalizePersonName(rawName, nameAliasMap);
+      const medId = rawMedId ? String(rawMedId).trim() : null;
+
+      if (normName) {
+        partTimeDoctorNameSet.add(normName);
+        if (medId) nameToMedicalIdMap.set(normName, medId);
+
+        // 🌟【新規】非常勤の時給タイプの仕分け
+        if (contractWageType === "時給表どおり") {
+          ptWageTypeMap.set(normName, "BASE");
+        } else if (contractWageType.includes("特別時給") || specialWageText) {
+          ptWageTypeMap.set(normName, "SPECIAL");
+          const rules = _parseSpecialWageText(specialWageText, clinicAliasMap);
+          ptSpecialWageRulesMap.set(normName, rules);
+        } else {
+          const wageVal = parseInt(contractWageType.replace(/,/g, ''), 10);
+          if (!isNaN(wageVal)) {
+            ptWageTypeMap.set(normName, "FLAT");
+            ptContractWageMap.set(normName, wageVal);
+          } else {
+            ptWageTypeMap.set(normName, "BASE"); // フォールバック
           }
         }
-      });
+
+        // 契約シフト情報のパース
+        if (medId && contractText) {
+          const rules = parseContractToRules(contractText);
+          const startDateRaw = row[ptHMap['入職日']];
+          let startDate = new Date('2000/01/01');
+          if (startDateRaw instanceof Date && !isNaN(startDateRaw.getTime())) {
+            startDate = new Date(startDateRaw);
+            startDate.setHours(0, 0, 0, 0);
+          }
+          const contracts = rules.map(rule => ({
+            location: gt_normalizeClinicName(rule.workplace, clinicAliasMap),
+            dayOfWeek: rule.dayOfWeek
+          })).filter(c => c.location && typeof c.dayOfWeek !== 'undefined');
+
+          ptDoctorContractMapById.set(medId, { startDate, contracts, name: normName });
+        }
+      }
+    }
+  }
+
+  // ====================================================================
+  // 🌟 [C] 紹介会社医師履歴 (外部シート) 読込
+  // ====================================================================
+  const agencyDoctorMedIds = new Map();
+  try {
+    const AGENCY_URL = "https://docs.google.com/spreadsheets/d/1Fd8uOCE1SKvLCIPjZZ7sE2rFsQFOhjVjHqoaqs-pXqE/edit";
+    const agencySs = SpreadsheetApp.openByUrl(AGENCY_URL);
+    const agencySheet = agencySs.getSheetByName("紹介会社医師履歴");
+    
+    if (agencySheet) {
+      const agencyData = agencySheet.getDataRange().getValues();
+      const aHMap = createHeaderMap(agencyData[0]);
+      for (let i = 1; i < agencyData.length; i++) {
+        const rawMedId = agencyData[i][aHMap['医籍番号']];
+        if (rawMedId) {
+          agencyDoctorMedIds.set(String(rawMedId).trim(), true);
+        }
+      }
     }
   } catch (e) {
-    Logger.log(`警告: '定期勤務医師リスト_2025年度' の読み込みに失敗: ${e.message}\n${e.stack}`);
+    Logger.log(`⚠️ 紹介会社マスタの読み込みに失敗しました: ${e.message}`);
   }
+  // ====================================================================
 
   const salesUrlMaps = {};
   urlListData.filter(r => r[0].toString().includes('売上')).forEach(e => {
@@ -113,7 +190,6 @@ function _loadInitialData(spreadsheet, targetDateObj) {
   
   const actualShiftUrls = new Map(urlListData.filter(r => r[0].includes('確定シフト')).map(r => [parseInt(r[0].match(/\d{4}/)?.[0]), r[1]]).filter(r => r[0]));
   
-  // ★ 修正箇所2: ターゲットの日付（または本日）から、動的に対象の「今年度」と「昨年度」を判定する
   const today = targetDateObj || new Date();
   const currentFiscalYear = (today.getMonth() + 1 <= 3) ? today.getFullYear() - 1 : today.getFullYear();
   const lastFiscalYear = currentFiscalYear - 1;
@@ -126,13 +202,12 @@ function _loadInitialData(spreadsheet, targetDateObj) {
     kansaiUrl: getEntry('2025関西シフト表')[1],
     payRateMaster: gt_getPayRateMaster(getEntry('2025時給表')[1]),
     holidays: gt_getHolidays(spreadsheet),
-    ftHourlyWageMap, ptContractWageMap, doctorContractMap,
-    ptDoctorContractMapById,
-    agencyShiftSet: _getAgencyShiftSet(urlListData, nameAliasMap),
-    
-    // ★ 修正箇所3: 決め打ちを辞め、対象の「今年度（currentFiscalYear）」を渡して動的に取得する
+    ftHourlyWageMap, 
+    ptWageTypeMap, ptContractWageMap, ptSpecialWageRulesMap, // ★新規追加: PTの時給分岐用
+    doctorContractMap, ptDoctorContractMapById,
+    agencyShiftSet: _getAgencyShiftSet(urlListData, nameAliasMap), 
+    agencyDoctorMedIds: agencyDoctorMedIds,
     budgetMap: _getBudgetMap(urlListData, clinicAliasMap, currentFiscalYear),
-    
     salesUrlMaps, actualShiftUrls,
     actualShiftUrl: actualShiftUrls.get(2025) || '',
     ftWageMap_LastYear: ftWageMap_LastYear,
@@ -142,6 +217,37 @@ function _loadInitialData(spreadsheet, targetDateObj) {
   };
 }
 
+/**
+ * 特別時給のテキストを解析するパーサー
+ * 例: "平日\n【錦糸町】19:00-21:00：時給：14,000円"
+ */
+function _parseSpecialWageText(text, clinicAliasMap) {
+  const rules = [];
+  const lines = text.split('\n');
+  let currentDayType = "ALL";
+  
+  for (let line of lines) {
+    line = line.trim();
+    if (!line) continue;
+    if (line === "平日") { currentDayType = "平日"; continue; }
+    if (line === "土曜日" || line === "土曜") { currentDayType = "土曜"; continue; }
+    if (line === "日曜日" || line === "日曜") { currentDayType = "日曜"; continue; }
+    if (line === "祝日" || line === "日祝") { currentDayType = "祝日"; continue; }
+    
+    // 【拠点】00:00-00:00：時給：00,000円 の形式を抽出
+    const match = line.match(/【([^】]+)】\s*(\d{1,2}:\d{2})\s*[-~〜]\s*(\d{1,2}:\d{2}).*?([\d,]+)円/);
+    if (match) {
+      const loc = gt_normalizeClinicName(match[1], clinicAliasMap);
+      const start = match[2];
+      const end = match[3];
+      const wage = parseInt(match[4].replace(/,/g, ''), 10);
+      rules.push({ dayType: currentDayType, loc: loc, start: start, end: end, wage: wage });
+    }
+  }
+  return rules;
+}
+
+// 既存のヘルパー関数群 (省略せずそのまま維持)
 function _getDoctorTypeForShift(medicalId, normalizedName, shiftDate, shiftLocation, settings) {
   if (medicalId && settings.ptDoctorContractMapById.has(medicalId)) {
     const contractInfo = settings.ptDoctorContractMapById.get(medicalId);
@@ -151,9 +257,7 @@ function _getDoctorTypeForShift(medicalId, normalizedName, shiftDate, shiftLocat
     return isContractedShift ? "定期非常勤" : "スポット";
   }
   const ftContractInfo = settings.doctorContractMap.get(normalizedName);
-  if (ftContractInfo && ftContractInfo.isFullTime) {
-    return "常勤";
-  }
+  if (ftContractInfo && ftContractInfo.isFullTime) { return "常勤"; }
   return "スポット";
 }
 
@@ -169,33 +273,17 @@ function parseContractToRules(text) {
     if (!dayMatch) return;
     const workplaceMatch = line.match(/【([^】]+)】/);
     if (!workplaceMatch) return;
-
-    rules.push({
-      dayOfWeek: dayMap[dayMatch[0].charAt(0)],
-      workplace: workplaceMatch[1].trim()
-    });
+    rules.push({ dayOfWeek: dayMap[dayMatch[0].charAt(0)], workplace: workplaceMatch[1].trim() });
   };
-
   lines.forEach(line => parseLine(line));
-
-  const uniqueRules = rules.filter((rule, index, self) =>
-    index === self.findIndex(r => (
-      r.dayOfWeek === rule.dayOfWeek && r.workplace === rule.workplace
-    ))
-  );
-  return uniqueRules;
+  return rules.filter((rule, index, self) => index === self.findIndex(r => (r.dayOfWeek === rule.dayOfWeek && r.workplace === rule.workplace)));
 }
-
 
 function gt_createSalesUrlMap(indexUrl) {
   const salesIndexSs = SpreadsheetApp.openByUrl(indexUrl);
   const monthlyUrlsData = salesIndexSs.getSheets()[0].getDataRange().getValues();
   const monthlyUrlMap = new Map();
-  monthlyUrlsData.forEach(row => {
-    if (row[0] instanceof Date) {
-      monthlyUrlMap.set(row[0].getMonth(), row[1]);
-    }
-  });
+  monthlyUrlsData.forEach(row => { if (row[0] instanceof Date) monthlyUrlMap.set(row[0].getMonth(), row[1]); });
   return monthlyUrlMap;
 }
 
@@ -227,22 +315,18 @@ function gt_getPayRateMaster(url) {
     const clinic = (row[0] || '').toString().trim();
     const department = (row[1] || '').toString().replace(/\s+/g, '');
     if (!clinic) return;
-    const key = `${clinic}||${department}`;
-    const payRates = {
+    masterData.set(`${clinic}||${department}`, {
       weekday: { am: row[3], pm: row[4], night: row[5] },
       saturday: { am: row[7], pm: row[8], night: row[9] },
       holiday: { am: row[11], pm: row[12], night: row[13] }
-    };
-    masterData.set(key, payRates);
+    });
   });
   return masterData;
 }
 
 function gt_getHolidays(spreadsheet) {
   const holidaySheet = spreadsheet.getSheetByName('祝日');
-  if (!holidaySheet) {
-    return new Set();
-  }
+  if (!holidaySheet) return new Set();
   return new Set(holidaySheet.getRange('A:A').getValues().flat().filter(String).map(d => Utilities.formatDate(new Date(d), "JST", "yyyy-MM-dd")));
 }
 
@@ -259,18 +343,14 @@ function gt_getCorrectPay(segment, dayType, masterRow) {
   if (!segment || !masterRow) return null;
   const type = dayType.toLowerCase();
   const zone = segment.name;
-  if (masterRow[type] && masterRow[type][zone]) {
-    return masterRow[type][zone];
-  }
+  if (masterRow[type] && masterRow[type][zone]) return masterRow[type][zone];
   return null;
 }
 
 function _getAgencyShiftSet(urlListData, nameAliasMap) {
   const agencyShiftSet = new Set();
   const entry = urlListData.find(row => row[0] === "紹介会社");
-  if (!entry || !entry[1] || !entry[2]) {
-    return agencyShiftSet;
-  }
+  if (!entry || !entry[1] || !entry[2]) return agencyShiftSet;
   const sheetNames = entry[2].toString().split(',').map(name => name.trim()).filter(String);
   const spreadsheet = SpreadsheetApp.openByUrl(entry[1]);
   sheetNames.forEach(sheetName => {
@@ -285,25 +365,17 @@ function _getAgencyShiftSet(urlListData, nameAliasMap) {
       const name = row[nameCol];
       const date = row[dateCol];
       if (name && date instanceof Date) {
-        const dateStr = `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
-        agencyShiftSet.add(`${gt_normalizePersonName(name, nameAliasMap)}|${dateStr}`);
+        agencyShiftSet.add(`${gt_normalizePersonName(name, nameAliasMap)}|${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`);
       }
     });
   });
   return agencyShiftSet;
 }
 
-// ★ 修正箇所4: 引数に fiscalYear を追加し、動的にその年の予算シートを探す
 function _getBudgetMap(urlListData, clinicAliasMap, fiscalYear) {
   const budgetMap = new Map();
-  const targetBudgetSheetName = `${fiscalYear}予算`; // 例: 2026予算
-
-  const entry = urlListData.find(row => row[0] === targetBudgetSheetName);
-  if (!entry || !entry[1] || !entry[2]) {
-    Logger.log(`⚠️ URLリストに「${targetBudgetSheetName}」が見つかりません。予算はすべて0円として計算します。`);
-    return budgetMap;
-  }
-
+  const entry = urlListData.find(row => row[0] === `${fiscalYear}予算`);
+  if (!entry || !entry[1] || !entry[2]) return budgetMap;
   try {
     const sheet = SpreadsheetApp.openByUrl(entry[1]).getSheetByName(entry[2]);
     const data = sheet.getDataRange().getValues();
@@ -311,9 +383,7 @@ function _getBudgetMap(urlListData, clinicAliasMap, fiscalYear) {
     const monthCols = {};
     for (let i = 4; i < monthHeaders.length; i++) {
       const monthMatch = String(monthHeaders[i]).match(/(\d+)\/(\d+)/);
-      if (monthMatch) {
-        monthCols[monthMatch[2]] = i;
-      }
+      if (monthMatch) monthCols[monthMatch[2]] = i;
     }
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
@@ -321,9 +391,8 @@ function _getBudgetMap(urlListData, clinicAliasMap, fiscalYear) {
       if (!rawClinicName) continue;
       const officialClinicName = gt_normalizeClinicName(rawClinicName, clinicAliasMap);
       if (!officialClinicName) continue;
-      if (!budgetMap.has(officialClinicName)) {
-        budgetMap.set(officialClinicName, {});
-      }
+      if (!budgetMap.has(officialClinicName)) budgetMap.set(officialClinicName, {});
+      
       const clinicBudget = budgetMap.get(officialClinicName);
       const itemColC = row[2];
       const itemColD = row[3];
@@ -334,43 +403,28 @@ function _getBudgetMap(urlListData, clinicAliasMap, fiscalYear) {
         else if (itemColC === "スポット医師") targetType = "spot_budget";
         else continue;
         if (!clinicBudget[targetType]) clinicBudget[targetType] = {};
-        for (const month in monthCols) {
-          clinicBudget[targetType][month] = row[monthCols[month]] || 0;
-        }
+        for (const month in monthCols) clinicBudget[targetType][month] = row[monthCols[month]] || 0;
       } else if (String(itemColC).trim() === "2診目" && String(itemColD).startsWith("コスト")) {
-        const targetType = "second_exam_budget";
-        if (!clinicBudget[targetType]) clinicBudget[targetType] = {};
-        for (const month in monthCols) {
-          clinicBudget[targetType][month] = row[monthCols[month]] || 0;
-        }
+        if (!clinicBudget["second_exam_budget"]) clinicBudget["second_exam_budget"] = {};
+        for (const month in monthCols) clinicBudget["second_exam_budget"][month] = row[monthCols[month]] || 0;
       }
     }
-  } catch (e) {
-    Logger.log(`予算マップの作成中にエラー: ${e.message}`);
-  }
+  } catch (e) { Logger.log(`予算マップの作成中にエラー: ${e.message}`); }
   return budgetMap;
 }
 
 function _loadLastYearFtWageMap(spreadsheetUrl) {
   const ftWageMap_LastYear = new Map();
-  if (!spreadsheetUrl) {
-    return ftWageMap_LastYear;
-  }
+  if (!spreadsheetUrl) return ftWageMap_LastYear;
   try {
     const sheet = SpreadsheetApp.openByUrl(spreadsheetUrl).getSheetByName("常勤医師給与");
-    if (!sheet) {
-      return ftWageMap_LastYear;
-    }
+    if (!sheet) return ftWageMap_LastYear;
     const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getValues();
     data.forEach(row => {
       const averageWage = row[2];
       const medicalId = row[3];
-      if (medicalId && typeof averageWage === 'number' && averageWage > 0) {
-        ftWageMap_LastYear.set(String(medicalId).trim(), averageWage);
-      }
+      if (medicalId && typeof averageWage === 'number' && averageWage > 0) ftWageMap_LastYear.set(String(medicalId).trim(), averageWage);
     });
-  } catch (e) {
-    Logger.log(`エラー: 「昨年度確定シフト」(常勤医師給与)の読み込みに失敗: ${e.message}`);
-  }
+  } catch (e) {}
   return ftWageMap_LastYear;
 }
